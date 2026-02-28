@@ -1,0 +1,56 @@
+# Build output
+/target
+/target-linux-amd64
+/target-linux-arm64
+
+# Cargo lock is kept for binaries, but generated files are not
+# Uncomment if this is a library crate:
+# Cargo.lock
+
+# Editor / IDE
+.idea/
+.vscode/
+*.iml
+.zed/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Compiled model weights and packages (large binary files)
+*.gguf
+*.onnx
+*.onnx_data
+*.aimod
+*.kapsl
+models/
+
+# Environment overrides
+.env
+.env.local
+
+# Profiling / flamegraph output
+perf.data
+perf.data.old
+flamegraph.svg
+cachegrind.out.*
+
+# Cross-compilation artifacts
+*.deb
+*.tar.gz
+*.tar.xz
+
+# Log files
+*.log
+*.jsonl
+
+.venv
+scripts/.venv/
+**/__pycache__/
+
+# Runtime temp/cache artifacts
+target/package-tmp/
+target/model-cache/
+target/inference-results.jsonl
+target/*.log
