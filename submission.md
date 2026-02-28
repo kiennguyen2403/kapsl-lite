@@ -4,8 +4,8 @@
 
 - Name: `kapsl-runtime-lite`
 - Track: Edge AI Runtime / Systems
-- Team: `<team name>`
-- Repo: `<repo url>`
+- Team: `kapsl`
+- Repo: `https://github.com/kiennguyen2403/kapsl-lite`
 - Demo Video: `<video url>`
 
 ## Problem
