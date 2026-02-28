@@ -268,6 +268,19 @@ fn render_centre_panel(frame: &mut ratatui::Frame, area: Rect, snapshot: &Metric
     frame.render_widget(gauge, centre[0]);
 
     let temperature_level = temperature_level(snapshot.temperature_c);
+    let battery_line = if let Some(percent) = snapshot.battery_percent {
+        format!(
+            "battery: {:.0}% discharging={} action={}",
+            percent,
+            snapshot.battery_discharging.unwrap_or(false),
+            snapshot.battery_action_label
+        )
+    } else {
+        format!(
+            "battery: unavailable action={}",
+            snapshot.battery_action_label
+        )
+    };
     let emergency_level = if snapshot.memory_emergency_active {
         EventLevel::Critical
     } else {
@@ -295,6 +308,10 @@ fn render_centre_panel(frame: &mut ratatui::Frame, area: Rect, snapshot: &Metric
         Line::styled(
             format!("temperature: {:.1} C", snapshot.temperature_c),
             Style::default().fg(color_for_level(temperature_level)),
+        ),
+        Line::styled(
+            battery_line,
+            Style::default().fg(color_for_level(snapshot.battery_action_level)),
         ),
         Line::styled(
             format!("fps: {:.2}", snapshot.fps),

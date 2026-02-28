@@ -2684,6 +2684,10 @@ fn battery_controller_loop(
 
     while !shutdown.load(Ordering::Relaxed) {
         let snapshot = read_battery_snapshot();
+        metrics.set_battery_snapshot(
+            snapshot.map(|value| value.capacity_percent),
+            snapshot.map(|value| value.is_discharging),
+        );
         let next_action = evaluate_battery_action(current_action, snapshot, &config);
 
         if next_action != current_action {
@@ -2758,6 +2762,7 @@ fn apply_battery_action_change(
     scheduler_state: &SchedulerState,
 ) {
     scheduler_state.set_battery_action(next_action);
+    metrics.set_battery_action_code(next_action as u8);
 
     let context = match snapshot {
         Some(snapshot) => format!(
@@ -3407,8 +3412,63 @@ fn read_battery_snapshot() -> Option<BatterySnapshot> {
 
     #[cfg(not(target_os = "linux"))]
     {
-        None
+        #[cfg(target_os = "windows")]
+        {
+            return read_windows_battery_snapshot();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            None
+        }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn read_windows_battery_snapshot() -> Option<BatterySnapshot> {
+    let script = r#"$b = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1 EstimatedChargeRemaining,BatteryStatus,PowerOnline; if ($b) { $b | ConvertTo-Json -Compress }"#;
+    let output = std::process::Command::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let capacity_percent = value
+        .get("EstimatedChargeRemaining")
+        .and_then(|field| field.as_f64().or_else(|| field.as_u64().map(|v| v as f64)))
+        .map(|percent| percent.clamp(0.0, 100.0))?;
+
+    let battery_status = value
+        .get("BatteryStatus")
+        .and_then(|field| field.as_u64().or_else(|| field.as_i64().map(|v| v as u64)));
+    let power_online = value.get("PowerOnline").and_then(Value::as_bool);
+
+    let is_discharging = if let Some(online) = power_online {
+        !online
+    } else {
+        matches!(battery_status, Some(1 | 4 | 5))
+    };
+
+    Some(BatterySnapshot {
+        capacity_percent,
+        is_discharging,
+    })
 }
 
 fn read_cpufreq_throttle_ratio() -> Option<f64> {

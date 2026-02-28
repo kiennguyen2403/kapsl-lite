@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_LATENCY_SAMPLES: usize = 512;
@@ -119,6 +119,10 @@ pub struct RuntimeMetrics {
     memory_rss_mib: AtomicU64,
     memory_budget_used_mib: AtomicU64,
     temperature_milli_c: AtomicU64,
+    battery_percent_milli: AtomicU64,
+    battery_available: AtomicBool,
+    battery_discharging: AtomicBool,
+    battery_action_code: AtomicU8,
     memory_limit_mib: AtomicU64,
     package_count: AtomicU64,
     latencies_ms: Mutex<VecDeque<u64>>,
@@ -150,6 +154,10 @@ pub struct MetricsSnapshot {
     pub memory_budget_used_mib: u64,
     pub memory_limit_mib: u64,
     pub temperature_c: f64,
+    pub battery_percent: Option<f64>,
+    pub battery_discharging: Option<bool>,
+    pub battery_action_label: String,
+    pub battery_action_level: EventLevel,
     pub package_count: u64,
     pub status_label: String,
     pub status_level: EventLevel,
@@ -177,6 +185,10 @@ impl RuntimeMetrics {
             memory_rss_mib: AtomicU64::new(0),
             memory_budget_used_mib: AtomicU64::new(0),
             temperature_milli_c: AtomicU64::new(0),
+            battery_percent_milli: AtomicU64::new(0),
+            battery_available: AtomicBool::new(false),
+            battery_discharging: AtomicBool::new(false),
+            battery_action_code: AtomicU8::new(0),
             memory_limit_mib: AtomicU64::new(memory_limit_mib.max(1)),
             package_count: AtomicU64::new(package_count.max(1)),
             latencies_ms: Mutex::new(VecDeque::with_capacity(MAX_LATENCY_SAMPLES)),
@@ -366,6 +378,28 @@ impl RuntimeMetrics {
             .store(temperature_milli_c, Ordering::Relaxed);
     }
 
+    pub fn set_battery_snapshot(&self, battery_percent: Option<f64>, discharging: Option<bool>) {
+        match (battery_percent, discharging) {
+            (Some(percent), Some(is_discharging)) => {
+                let percent_milli = (percent.clamp(0.0, 100.0) * 1000.0).round() as u64;
+                self.battery_percent_milli
+                    .store(percent_milli, Ordering::Relaxed);
+                self.battery_discharging
+                    .store(is_discharging, Ordering::Relaxed);
+                self.battery_available.store(true, Ordering::Relaxed);
+            }
+            _ => {
+                self.battery_available.store(false, Ordering::Relaxed);
+                self.battery_percent_milli.store(0, Ordering::Relaxed);
+                self.battery_discharging.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn set_battery_action_code(&self, code: u8) {
+        self.battery_action_code.store(code, Ordering::Relaxed);
+    }
+
     pub fn set_status<S: Into<String>>(&self, label: S, level: EventLevel) {
         let mut status = self
             .status
@@ -452,6 +486,26 @@ impl RuntimeMetrics {
         let memory_budget_used_mib = self.memory_budget_used_mib.load(Ordering::Relaxed);
         let memory_limit_mib = self.memory_limit_mib.load(Ordering::Relaxed).max(1);
         let temperature_c = self.temperature_milli_c.load(Ordering::Relaxed) as f64 / 1000.0;
+        let battery_available = self.battery_available.load(Ordering::Relaxed);
+        let battery_percent = if battery_available {
+            Some(self.battery_percent_milli.load(Ordering::Relaxed) as f64 / 1000.0)
+        } else {
+            None
+        };
+        let battery_discharging = if battery_available {
+            Some(self.battery_discharging.load(Ordering::Relaxed))
+        } else {
+            None
+        };
+        let (battery_action_label, battery_action_level) = if !battery_available {
+            ("unavailable".to_string(), EventLevel::Warning)
+        } else {
+            match self.battery_action_code.load(Ordering::Relaxed) {
+                1 => ("conserve".to_string(), EventLevel::Warning),
+                2 => ("critical".to_string(), EventLevel::Critical),
+                _ => ("normal".to_string(), EventLevel::Normal),
+            }
+        };
         let package_count = self.package_count.load(Ordering::Relaxed).max(1);
         let memory_emergency_active = self.memory_emergency_active.load(Ordering::Relaxed);
         let emergency_worker_parked_total =
@@ -525,6 +579,10 @@ impl RuntimeMetrics {
             memory_budget_used_mib,
             memory_limit_mib,
             temperature_c,
+            battery_percent,
+            battery_discharging,
+            battery_action_label,
+            battery_action_level,
             package_count,
             status_label,
             status_level,
