@@ -3,9 +3,12 @@ use crate::package::{
     OnnxRuntimeTuningSpec, PackageThermalThresholds, Priority, QueueOverflowPolicy, SwapPolicy,
     TaskClass, TriggerMode,
 };
-use kapsl_core::PackageLoader;
+use fs2::available_space;
 use kapsl_core::loader::{LoaderError as CoreLoaderError, Manifest};
+use kapsl_core::PackageLoader;
 use serde_json::{Map, Value};
+use std::collections::HashSet;
+use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,6 +22,14 @@ pub enum LoadError {
     ModelFileMissing {
         package: PathBuf,
         model_file: String,
+    },
+    InsufficientDiskSpace {
+        cache_root: PathBuf,
+        required_copy_bytes: u64,
+        available_bytes: u64,
+        reserved_free_bytes: u64,
+        cache_usage_bytes: u64,
+        max_cache_bytes: Option<u64>,
     },
     InvalidMetadata {
         field: String,
@@ -40,6 +51,25 @@ impl std::fmt::Display for LoadError {
                 package.display(),
                 model_file
             ),
+            Self::InsufficientDiskSpace {
+                cache_root,
+                required_copy_bytes,
+                available_bytes,
+                reserved_free_bytes,
+                cache_usage_bytes,
+                max_cache_bytes,
+            } => write!(
+                f,
+                "insufficient disk space for model cache at {} (required_copy={}B available={}B reserved_free={}B cache_usage={}B cache_limit={})",
+                cache_root.display(),
+                required_copy_bytes,
+                available_bytes,
+                reserved_free_bytes,
+                cache_usage_bytes,
+                max_cache_bytes
+                    .map(|value| format!("{value}B"))
+                    .unwrap_or_else(|| "none".to_string())
+            ),
             Self::InvalidMetadata { field, reason } => {
                 write!(f, "invalid metadata field '{}': {}", field, reason)
             }
@@ -52,9 +82,58 @@ impl std::error::Error for LoadError {
         match self {
             Self::Io(e) => Some(e),
             Self::Package(e) => Some(e),
-            Self::ModelFileMissing { .. } | Self::InvalidMetadata { .. } => None,
+            Self::ModelFileMissing { .. }
+            | Self::InsufficientDiskSpace { .. }
+            | Self::InvalidMetadata { .. } => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachePolicy {
+    max_cache_bytes: Option<u64>,
+    reserved_free_bytes: u64,
+}
+
+impl CachePolicy {
+    fn from_env() -> Self {
+        Self {
+            max_cache_bytes: read_bytes_env(
+                &[
+                    "KAPSL_LITE_MODEL_CACHE_MAX_BYTES",
+                    "KAPSL_MODEL_CACHE_MAX_BYTES",
+                ],
+                &[
+                    "KAPSL_LITE_MODEL_CACHE_MAX_MIB",
+                    "KAPSL_MODEL_CACHE_MAX_MIB",
+                ],
+            ),
+            reserved_free_bytes: read_bytes_env(
+                &[
+                    "KAPSL_LITE_MODEL_CACHE_RESERVED_FREE_BYTES",
+                    "KAPSL_MODEL_CACHE_RESERVED_FREE_BYTES",
+                ],
+                &[
+                    "KAPSL_LITE_MODEL_CACHE_RESERVED_FREE_MIB",
+                    "KAPSL_MODEL_CACHE_RESERVED_FREE_MIB",
+                ],
+            )
+            .unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    path: PathBuf,
+    bytes: u64,
+    modified_ns: u128,
+}
+
+#[derive(Debug, Clone)]
+struct ModelAsset {
+    source_path: PathBuf,
+    target_name: String,
 }
 
 impl From<io::Error> for LoadError {
@@ -113,19 +192,31 @@ fn persist_model_file(
         .unwrap_or("model.bin");
     let cache_root = resolve_model_cache_root(package_path);
     let cache_dir = cache_root.join(format!("{:016x}", package_hash));
-    match persist_model_assets(source_model_path, &cache_dir, file_name) {
+    let cache_policy = CachePolicy::from_env();
+    match persist_model_assets(
+        source_model_path,
+        &cache_root,
+        &cache_dir,
+        file_name,
+        cache_policy,
+    ) {
         Ok(path) => Ok(path),
-        Err(error) if is_windows_mapped_section_error(&error) => {
+        Err(LoadError::Io(error)) if is_windows_mapped_section_error(&error) => {
             let fallback_cache_dir = cache_root.join(format!(
                 "{:016x}-{:x}-{:x}",
                 package_hash,
                 std::process::id(),
                 unique_cache_nonce()
             ));
-            persist_model_assets(source_model_path, &fallback_cache_dir, file_name)
-                .map_err(LoadError::Io)
+            persist_model_assets(
+                source_model_path,
+                &cache_root,
+                &fallback_cache_dir,
+                file_name,
+                cache_policy,
+            )
         }
-        Err(error) => Err(LoadError::Io(error)),
+        Err(error) => Err(error),
     }
 }
 
@@ -147,83 +238,265 @@ fn resolve_model_cache_root(package_path: &Path) -> PathBuf {
 
 fn persist_model_assets(
     source_model_path: &Path,
+    cache_root: &Path,
     cache_dir: &Path,
     file_name: &str,
-) -> io::Result<PathBuf> {
-    std::fs::create_dir_all(cache_dir)?;
-    let persisted_path = cache_dir.join(file_name);
-    copy_if_needed(source_model_path, &persisted_path)?;
-    persist_model_external_data(source_model_path, cache_dir)?;
-    persist_model_sidecar_assets(source_model_path, cache_dir)?;
-    Ok(persisted_path)
+    cache_policy: CachePolicy,
+) -> Result<PathBuf, LoadError> {
+    fs::create_dir_all(cache_root).map_err(LoadError::Io)?;
+    fs::create_dir_all(cache_dir).map_err(LoadError::Io)?;
+
+    let assets = collect_model_assets(source_model_path, file_name).map_err(LoadError::Io)?;
+    let required_copy_bytes =
+        estimate_required_copy_bytes(&assets, cache_dir).map_err(LoadError::Io)?;
+
+    enforce_cache_policy(
+        cache_root,
+        cache_dir,
+        required_copy_bytes,
+        cache_policy,
+        |path| available_space(path),
+    )?;
+
+    for asset in assets {
+        copy_if_needed(&asset.source_path, &cache_dir.join(asset.target_name))
+            .map_err(LoadError::Io)?;
+    }
+
+    Ok(cache_dir.join(file_name))
 }
 
-fn persist_model_external_data(source_model_path: &Path, cache_dir: &Path) -> io::Result<()> {
-    let Some(source_dir) = source_model_path.parent() else {
-        return Ok(());
-    };
-    let Some(model_name) = source_model_path.file_name().and_then(|name| name.to_str()) else {
-        return Ok(());
-    };
+fn collect_model_assets(
+    source_model_path: &Path,
+    model_target_name: &str,
+) -> io::Result<Vec<ModelAsset>> {
+    let mut assets = Vec::new();
+    let mut seen_targets = HashSet::new();
 
-    let prefix_a = format!("{model_name}_data");
-    let prefix_b = format!("{model_name}.data");
-    for entry in std::fs::read_dir(source_dir)? {
+    assets.push(ModelAsset {
+        source_path: source_model_path.to_path_buf(),
+        target_name: model_target_name.to_string(),
+    });
+    seen_targets.insert(model_target_name.to_string());
+
+    let Some(source_dir) = source_model_path.parent() else {
+        return Ok(assets);
+    };
+    let main_model_name = source_model_path.file_name();
+
+    for entry in fs::read_dir(source_dir)? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !file_name.starts_with(&prefix_a) && !file_name.starts_with(&prefix_b) {
+        if path.file_name() == main_model_name {
             continue;
         }
-        copy_if_needed(&path, &cache_dir.join(file_name))?;
+        let target_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if target_name.is_empty() || !seen_targets.insert(target_name.clone()) {
+            continue;
+        }
+        assets.push(ModelAsset {
+            source_path: path,
+            target_name,
+        });
     }
 
-    Ok(())
+    Ok(assets)
 }
 
-fn persist_model_sidecar_assets(source_model_path: &Path, cache_dir: &Path) -> io::Result<()> {
-    let Some(source_dir) = source_model_path.parent() else {
-        return Ok(());
-    };
-    let main_model_name = source_model_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_string();
+fn estimate_required_copy_bytes(assets: &[ModelAsset], cache_dir: &Path) -> io::Result<u64> {
+    let mut required_bytes = 0u64;
+    for asset in assets {
+        let source_meta = fs::metadata(&asset.source_path)?;
+        let target_path = cache_dir.join(&asset.target_name);
+        if should_copy_file(source_meta.len(), &target_path)? {
+            required_bytes = required_bytes.saturating_add(source_meta.len());
+        }
+    }
+    Ok(required_bytes)
+}
 
-    for entry in std::fs::read_dir(source_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if file_name == main_model_name {
-            continue;
-        }
-        copy_if_needed(&path, &cache_dir.join(file_name))?;
+fn enforce_cache_policy<F>(
+    cache_root: &Path,
+    protected_cache_dir: &Path,
+    required_copy_bytes: u64,
+    cache_policy: CachePolicy,
+    mut query_available_space: F,
+) -> Result<(), LoadError>
+where
+    F: FnMut(&Path) -> io::Result<u64>,
+{
+    if cache_policy.max_cache_bytes.is_none() && cache_policy.reserved_free_bytes == 0 {
+        return Ok(());
     }
 
-    Ok(())
+    fs::create_dir_all(cache_root).map_err(LoadError::Io)?;
+    let mut entries =
+        load_cache_entries(cache_root, Some(protected_cache_dir)).map_err(LoadError::Io)?;
+    let mut cache_usage_bytes = directory_size_bytes(cache_root).map_err(LoadError::Io)?;
+
+    loop {
+        let available_bytes = query_available_space(cache_root).map_err(LoadError::Io)?;
+        let required_available_bytes = cache_policy
+            .reserved_free_bytes
+            .saturating_add(required_copy_bytes);
+        let free_ok = available_bytes >= required_available_bytes;
+        let cap_ok = match cache_policy.max_cache_bytes {
+            Some(max_bytes) => cache_usage_bytes.saturating_add(required_copy_bytes) <= max_bytes,
+            None => true,
+        };
+
+        if free_ok && cap_ok {
+            return Ok(());
+        }
+
+        let Some(entry) = entries.first().cloned() else {
+            return Err(LoadError::InsufficientDiskSpace {
+                cache_root: cache_root.to_path_buf(),
+                required_copy_bytes,
+                available_bytes,
+                reserved_free_bytes: cache_policy.reserved_free_bytes,
+                cache_usage_bytes,
+                max_cache_bytes: cache_policy.max_cache_bytes,
+            });
+        };
+        entries.remove(0);
+        remove_cache_entry(&entry.path).map_err(LoadError::Io)?;
+        cache_usage_bytes = cache_usage_bytes.saturating_sub(entry.bytes);
+    }
+}
+
+fn load_cache_entries(
+    cache_root: &Path,
+    protected_path: Option<&Path>,
+) -> io::Result<Vec<CacheEntry>> {
+    if !cache_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(cache_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if protected_path.is_some_and(|protected| protected == path) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let bytes = if metadata.is_dir() {
+            directory_size_bytes(&path)?
+        } else if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        };
+        entries.push(CacheEntry {
+            path,
+            bytes,
+            modified_ns: modified_ns(&metadata),
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        a.modified_ns
+            .cmp(&b.modified_ns)
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    Ok(entries)
+}
+
+fn remove_cache_entry(path: &Path) -> io::Result<()> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    let removal = if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    };
+    match removal {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn directory_size_bytes(path: &Path) -> io::Result<u64> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    if !metadata.is_dir() {
+        return Ok(0);
+    }
+
+    let mut total = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let child_path = entry.path();
+        let child_meta = entry.metadata()?;
+        if child_meta.is_dir() {
+            total = total.saturating_add(directory_size_bytes(&child_path)?);
+        } else if child_meta.is_file() {
+            total = total.saturating_add(child_meta.len());
+        }
+    }
+    Ok(total)
+}
+
+fn modified_ns(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_nanos())
+        .unwrap_or(0)
 }
 
 fn copy_if_needed(source: &Path, destination: &Path) -> io::Result<()> {
-    let source_meta = std::fs::metadata(source)?;
-    if let Ok(destination_meta) = std::fs::metadata(destination)
-        && destination_meta.len() == source_meta.len()
-        && destination_meta.len() > 0
-    {
+    let source_meta = fs::metadata(source)?;
+    if !should_copy_file(source_meta.len(), destination)? {
         return Ok(());
     }
-    std::fs::copy(source, destination)?;
+    fs::copy(source, destination)?;
     Ok(())
+}
+
+fn should_copy_file(source_len: u64, destination: &Path) -> io::Result<bool> {
+    match fs::metadata(destination) {
+        Ok(destination_meta) => Ok(!(destination_meta.len() == source_len && source_len > 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_bytes_env(byte_keys: &[&str], mib_keys: &[&str]) -> Option<u64> {
+    read_u64_env(byte_keys)
+        .or_else(|| read_u64_env(mib_keys).map(|value| value.saturating_mul(1024 * 1024)))
+}
+
+fn read_u64_env(keys: &[&str]) -> Option<u64> {
+    for key in keys {
+        let Ok(raw) = std::env::var(key) else {
+            continue;
+        };
+        let Ok(value) = raw.trim().parse::<u64>() else {
+            continue;
+        };
+        return Some(value);
+    }
+    None
 }
 
 fn unique_cache_nonce() -> u128 {
@@ -880,9 +1153,10 @@ fn object_u64_field(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::Compression;
     use flate2::write::GzEncoder;
+    use flate2::Compression;
     use serde_json::json;
+    use std::fs;
     use std::fs::File;
     use tar::Builder;
     use tempfile::TempDir;
@@ -925,6 +1199,11 @@ mod tests {
         let encoder = archive.into_inner().unwrap();
         let _ = encoder.finish().unwrap();
         package_path
+    }
+
+    fn write_sized_file(path: &Path, bytes: usize) {
+        let data = vec![b'x'; bytes];
+        fs::write(path, data).unwrap();
     }
 
     #[test]
@@ -1186,5 +1465,83 @@ mod tests {
         assert_eq!(specs.len(), 2);
         assert_eq!(specs[0].name, "high.pkg");
         assert_eq!(specs[1].name, "low.pkg");
+    }
+
+    #[test]
+    fn cache_policy_evicts_oldest_entries_when_over_limit() {
+        let dir = TempDir::new().unwrap();
+        let cache_root = dir.path().join("cache");
+        let old_entry = cache_root.join("a-old");
+        let new_entry = cache_root.join("z-new");
+        fs::create_dir_all(&old_entry).unwrap();
+        fs::create_dir_all(&new_entry).unwrap();
+        write_sized_file(&old_entry.join("model.bin"), 64);
+        write_sized_file(&new_entry.join("model.bin"), 64);
+
+        enforce_cache_policy(
+            &cache_root,
+            &cache_root.join("active"),
+            0,
+            CachePolicy {
+                max_cache_bytes: Some(100),
+                reserved_free_bytes: 0,
+            },
+            |_| Ok(u64::MAX / 4),
+        )
+        .expect("eviction should satisfy cache cap");
+
+        assert!(!old_entry.exists(), "oldest cache entry should be evicted");
+        assert!(new_entry.exists(), "newer cache entry should remain");
+    }
+
+    #[test]
+    fn cache_policy_keeps_entries_when_requirements_already_met() {
+        let dir = TempDir::new().unwrap();
+        let cache_root = dir.path().join("cache");
+        let only_entry = cache_root.join("single");
+        fs::create_dir_all(&only_entry).unwrap();
+        write_sized_file(&only_entry.join("model.bin"), 32);
+
+        enforce_cache_policy(
+            &cache_root,
+            &cache_root.join("active"),
+            0,
+            CachePolicy {
+                max_cache_bytes: Some(1024),
+                reserved_free_bytes: 0,
+            },
+            |_| Ok(u64::MAX / 4),
+        )
+        .expect("no eviction required");
+
+        assert!(only_entry.exists(), "cache entry should not be evicted");
+    }
+
+    #[test]
+    fn cache_policy_returns_insufficient_space_when_unrecoverable() {
+        let dir = TempDir::new().unwrap();
+        let cache_root = dir.path().join("cache");
+        let entry = cache_root.join("only-entry");
+        fs::create_dir_all(&entry).unwrap();
+        write_sized_file(&entry.join("model.bin"), 16);
+
+        let result = enforce_cache_policy(
+            &cache_root,
+            &cache_root.join("active"),
+            128,
+            CachePolicy {
+                max_cache_bytes: None,
+                reserved_free_bytes: 1,
+            },
+            |_| Ok(0),
+        );
+
+        assert!(matches!(
+            result,
+            Err(LoadError::InsufficientDiskSpace {
+                required_copy_bytes: 128,
+                ..
+            })
+        ));
     }
 }

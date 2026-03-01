@@ -5,10 +5,10 @@ use crate::package::{
 };
 use crate::system::SystemSampler;
 use crate::trigger::{NormalizedInputEvent, NormalizedPayload, TriggerBus, TriggerEvent};
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender, TryRecvError, TrySendError};
 use futures::executor::block_on;
-use kapsl_backends::OnnxBackend;
 use kapsl_backends::onnx::OnnxBackendBuilder;
+use kapsl_backends::OnnxBackend;
 use kapsl_engine_api::{
     BinaryTensorPacket, Engine, InferenceRequest, RequestMetadata, TensorDtype,
 };
@@ -19,7 +19,7 @@ use std::collections::{BinaryHeap, HashMap};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1868,6 +1868,8 @@ pub struct RuntimeHandle {
     threads: Vec<JoinHandle<()>>,
 }
 
+type InterModelRoutes = HashMap<String, Vec<String>>;
+
 impl RuntimeHandle {
     pub fn start(
         config: RuntimeConfig,
@@ -1878,8 +1880,20 @@ impl RuntimeHandle {
         let (trigger_bus, trigger_rx) = TriggerBus::new(config.trigger_bus_capacity);
         let scheduler_state = Arc::new(SchedulerState::new());
         let registry = Arc::new(PackageRegistry::new(config.memory_limit_mib));
+        let inter_model_routes = Arc::new(parse_inter_model_routes_from_env());
 
         metrics.set_status("loading", EventLevel::Normal);
+        if !inter_model_routes.is_empty() {
+            let route_count = inter_model_routes.values().map(Vec::len).sum::<usize>();
+            metrics.push_scheduler_log(
+                EventLevel::Normal,
+                format!(
+                    "inter-model routing enabled: sources={} routes={} env=KAPSL_LITE_INTER_MODEL_ROUTES",
+                    inter_model_routes.len(),
+                    route_count
+                ),
+            );
+        }
 
         let mut threads = Vec::new();
 
@@ -1953,6 +1967,8 @@ impl RuntimeHandle {
                     let cycle_ms = spec.cycle_interval_ms();
                     let scheduler_c = scheduler_state.clone();
                     let spec_c = spec.clone();
+                    let trigger_bus_c = trigger_bus.clone();
+                    let inter_model_routes_c = inter_model_routes.clone();
 
                     threads.push(thread::spawn(move || {
                         always_running_loop(
@@ -1962,6 +1978,8 @@ impl RuntimeHandle {
                             registry_c,
                             metrics_c,
                             shutdown_c,
+                            trigger_bus_c,
+                            inter_model_routes_c,
                         );
                     }));
                 }
@@ -2021,6 +2039,8 @@ impl RuntimeHandle {
                         let shutdown_c = shutdown.clone();
                         let spec_c = spec.clone();
                         let rx_c = pkg_rx.clone();
+                        let trigger_bus_c = trigger_bus.clone();
+                        let inter_model_routes_c = inter_model_routes.clone();
 
                         threads.push(thread::spawn(move || {
                             on_demand_loop(
@@ -2031,6 +2051,8 @@ impl RuntimeHandle {
                                 registry_c,
                                 metrics_c,
                                 shutdown_c,
+                                trigger_bus_c,
+                                inter_model_routes_c,
                             );
                         }));
                     }
@@ -2134,6 +2156,8 @@ fn always_running_loop(
     registry: Arc<PackageRegistry>,
     metrics: Arc<RuntimeMetrics>,
     shutdown: Arc<AtomicBool>,
+    trigger_bus: TriggerBus,
+    inter_model_routes: Arc<InterModelRoutes>,
 ) {
     let package_name = spec.name.clone();
     let format_str = spec.format.as_str().to_string();
@@ -2141,6 +2165,13 @@ fn always_running_loop(
     let mut backend = create_backend_for_spec(&spec, metrics.as_ref());
     let mut next_tick = Instant::now();
     let mut memory_paused = false;
+    let relay_interval_ms =
+        read_env_u64("KAPSL_LITE_INTER_MODEL_RELAY_MIN_INTERVAL_MS", 2000).max(100);
+    let relay_interval = Duration::from_millis(relay_interval_ms);
+    let relay_enabled = inter_model_routes.contains_key(&package_name);
+    let mut last_relay_at = Instant::now()
+        .checked_sub(relay_interval)
+        .unwrap_or_else(Instant::now);
 
     registry.set_status(&package_name, PackageStatus::Running);
 
@@ -2221,6 +2252,19 @@ fn always_running_loop(
 
         metrics.mark_job_finished(wall_ms, outcome.success);
         metrics.mark_model_finished(&package_name);
+        if relay_enabled && last_relay_at.elapsed() >= relay_interval {
+            maybe_publish_inter_model_report(
+                &package_name,
+                outcome.success,
+                outcome.latency_ms.max(wall_ms),
+                &outcome.output_summary,
+                None,
+                inter_model_routes.as_ref(),
+                &trigger_bus,
+                metrics.as_ref(),
+            );
+            last_relay_at = Instant::now();
+        }
         metrics.push_inference_result(InferenceResult {
             timestamp_ms: unix_time_millis(),
             package_name: package_name.clone(),
@@ -2255,6 +2299,8 @@ fn on_demand_loop(
     registry: Arc<PackageRegistry>,
     metrics: Arc<RuntimeMetrics>,
     shutdown: Arc<AtomicBool>,
+    trigger_bus: TriggerBus,
+    inter_model_routes: Arc<InterModelRoutes>,
 ) {
     let package_name = spec.name.clone();
     let format_str = spec.format.as_str().to_string();
@@ -2456,6 +2502,16 @@ fn on_demand_loop(
         metrics.mark_job_finished(wall_ms, outcome.success);
         metrics.mark_model_finished(&package_name);
         metrics.set_model_queue_depth(&package_name, trigger_rx.len());
+        maybe_publish_inter_model_report(
+            &package_name,
+            outcome.success,
+            outcome.latency_ms.max(wall_ms),
+            &outcome.output_summary,
+            input_event,
+            inter_model_routes.as_ref(),
+            &trigger_bus,
+            metrics.as_ref(),
+        );
         metrics.push_inference_result(InferenceResult {
             timestamp_ms: unix_time_millis(),
             package_name: package_name.clone(),
@@ -3517,6 +3573,127 @@ fn factor_to_milli(factor: f64) -> u64 {
     (factor.clamp(0.05, 1.0) * 1000.0).round() as u64
 }
 
+fn parse_inter_model_routes_from_env() -> InterModelRoutes {
+    let raw = env::var("KAPSL_LITE_INTER_MODEL_ROUTES").unwrap_or_default();
+    parse_inter_model_routes(&raw)
+}
+
+fn parse_inter_model_routes(raw: &str) -> InterModelRoutes {
+    let mut routes = HashMap::<String, Vec<String>>::new();
+    for rule in raw.split([';', '\n']) {
+        let trimmed = rule.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((source_raw, target_raw)) =
+            trimmed.split_once('=').or_else(|| trimmed.split_once("->"))
+        else {
+            continue;
+        };
+        let source = source_raw.trim();
+        if source.is_empty() {
+            continue;
+        }
+        for target in target_raw
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            let entry = routes.entry(source.to_string()).or_default();
+            if !entry.iter().any(|existing| existing == target) {
+                entry.push(target.to_string());
+            }
+        }
+    }
+    routes
+}
+
+fn input_relay_hops(input: Option<&NormalizedInputEvent>) -> u64 {
+    input
+        .and_then(|event| event.metadata.get("_relay_hop"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn maybe_publish_inter_model_report(
+    source_package: &str,
+    success: bool,
+    latency_ms: u64,
+    output_summary: &str,
+    input_event: Option<&NormalizedInputEvent>,
+    inter_model_routes: &InterModelRoutes,
+    trigger_bus: &TriggerBus,
+    metrics: &RuntimeMetrics,
+) {
+    if !success {
+        return;
+    }
+    if input_relay_hops(input_event) > 0 {
+        return;
+    }
+
+    let Some(targets) = inter_model_routes.get(source_package) else {
+        return;
+    };
+
+    let forward_text = output_summary.trim();
+    if forward_text.is_empty() {
+        return;
+    }
+    let prompt = format!("Report from {}:\n{}", source_package, forward_text);
+
+    for target in targets {
+        if target == source_package {
+            metrics.push_scheduler_log(
+                EventLevel::Warning,
+                format!(
+                    "inter-model relay skipped: source={} target={} reason=self-route",
+                    source_package, target
+                ),
+            );
+            continue;
+        }
+        let mut metadata = Map::new();
+        metadata.insert("prompt".to_string(), Value::String(prompt.clone()));
+        metadata.insert(
+            "source_package".to_string(),
+            Value::String(source_package.to_string()),
+        );
+        metadata.insert("source_latency_ms".to_string(), Value::from(latency_ms));
+        metadata.insert("_relay_hop".to_string(), Value::from(1u64));
+
+        let relay_event = TriggerEvent::ExternalInput {
+            target_package: target.clone(),
+            event: NormalizedInputEvent {
+                timestamp_ms: unix_time_millis(),
+                source_id: format!("model/{}", source_package),
+                payload: NormalizedPayload::Json(Value::String(forward_text.to_string())),
+                metadata,
+            },
+        };
+        match trigger_bus.publish(relay_event) {
+            Ok(()) => metrics.push_scheduler_log(
+                EventLevel::Normal,
+                format!(
+                    "inter-model relay published: source={} target={} payload={}B",
+                    source_package,
+                    target,
+                    forward_text.len()
+                ),
+            ),
+            Err(error) => metrics.push_scheduler_log(
+                EventLevel::Warning,
+                format!(
+                    "inter-model relay dropped: source={} target={} reason={}",
+                    source_package,
+                    target,
+                    error.as_reason()
+                ),
+            ),
+        }
+    }
+}
+
 fn trigger_age_ms(event: &TriggerEvent) -> Option<u64> {
     match event {
         TriggerEvent::ExternalInput { event, .. } => {
@@ -3750,12 +3927,10 @@ mod tests {
             rx.try_recv().is_err(),
             "detection trigger should be deferred"
         );
-        assert!(
-            metrics
-                .scheduler_logs()
-                .iter()
-                .any(|entry| entry.message.contains("reason=battery-conserve"))
-        );
+        assert!(metrics
+            .scheduler_logs()
+            .iter()
+            .any(|entry| entry.message.contains("reason=battery-conserve")));
     }
 
     #[test]
@@ -3788,11 +3963,95 @@ mod tests {
         );
 
         assert!(rx.try_recv().is_err(), "manual trigger should be rejected");
-        assert!(
-            metrics
-                .scheduler_logs()
-                .iter()
-                .any(|entry| entry.message.contains("reason=battery-critical"))
+        assert!(metrics
+            .scheduler_logs()
+            .iter()
+            .any(|entry| entry.message.contains("reason=battery-critical")));
+    }
+
+    #[test]
+    fn parse_inter_model_routes_parses_multiple_rules() {
+        let routes = parse_inter_model_routes(
+            "voxtral-mini-3b-2507=mistral-llm; camera-detector -> mistral-llm,triage-llm",
         );
+        assert_eq!(
+            routes.get("voxtral-mini-3b-2507"),
+            Some(&vec!["mistral-llm".to_string()])
+        );
+        assert_eq!(
+            routes.get("camera-detector"),
+            Some(&vec!["mistral-llm".to_string(), "triage-llm".to_string()])
+        );
+    }
+
+    #[test]
+    fn inter_model_relay_publishes_external_input_trigger() {
+        let routes = parse_inter_model_routes("voxtral-mini-3b-2507=mistral-llm");
+        let (bus, rx) = TriggerBus::new(4);
+        let metrics = RuntimeMetrics::new(1, 512);
+
+        maybe_publish_inter_model_report(
+            "voxtral-mini-3b-2507",
+            true,
+            77,
+            "detected: glass breaking near front door",
+            None,
+            &routes,
+            &bus,
+            &metrics,
+        );
+
+        let event = rx.try_recv().expect("relay should publish an event");
+        match event {
+            TriggerEvent::ExternalInput {
+                target_package,
+                event,
+            } => {
+                assert_eq!(target_package, "mistral-llm");
+                assert_eq!(event.source_id, "model/voxtral-mini-3b-2507");
+                assert!(matches!(
+                    event.payload,
+                    NormalizedPayload::Json(Value::String(_))
+                ));
+                assert_eq!(
+                    event.metadata.get("_relay_hop").and_then(Value::as_u64),
+                    Some(1)
+                );
+                assert!(event
+                    .metadata
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.contains("glass breaking")));
+            }
+            _ => panic!("expected external relay trigger"),
+        }
+    }
+
+    #[test]
+    fn inter_model_relay_skips_already_relayed_input() {
+        let routes = parse_inter_model_routes("voxtral-mini-3b-2507=mistral-llm");
+        let (bus, rx) = TriggerBus::new(4);
+        let metrics = RuntimeMetrics::new(1, 512);
+        let mut metadata = Map::new();
+        metadata.insert("_relay_hop".to_string(), Value::from(1u64));
+        let relayed_input = NormalizedInputEvent {
+            timestamp_ms: unix_time_millis(),
+            source_id: "model/other".to_string(),
+            payload: NormalizedPayload::Json(Value::String("prior".to_string())),
+            metadata,
+        };
+
+        maybe_publish_inter_model_report(
+            "voxtral-mini-3b-2507",
+            true,
+            55,
+            "detected: siren",
+            Some(&relayed_input),
+            &routes,
+            &bus,
+            &metrics,
+        );
+
+        assert!(rx.try_recv().is_err(), "relay should not recurse");
     }
 }
