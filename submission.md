@@ -6,7 +6,7 @@
 - Track: Edge AI Runtime / Systems
 - Team: `kapsl`
 - Repo: `https://github.com/kiennguyen2403/kapsl-lite`
-- Demo Video: `<video url>`
+- Demo Video: `https://www.youtube.com/watch?v=dM9oB4N5iDg`
 
 ## Problem
 
